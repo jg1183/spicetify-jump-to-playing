@@ -1,0 +1,11 @@
+{
+    "name": "Jump To Playing",
+    "description": "Open the playlist, album or Liked Songs that's playing and it scrolls straight to the current song, centres it and highlights it.",
+    "preview": "preview.png",
+    "main": "jumpToPlaying.js",
+    "readme": "README.md",
+    "authors": [
+        { "name": "JackG", "url": "https://github.com/JG1183" }
+    ],
+    "tags": ["playlist", "scroll", "now playing", "utility"]
+}
