@@ -54,7 +54,7 @@
 	}
 
 	function highlight(row) {
-		row.scrollIntoView({ block: "center" });
+		row.scrollIntoView({ block: "center", behavior: "instant" });
 		const prev = row.style.transition, prevBg = row.style.backgroundColor;
 		row.style.transition = "background-color .6s";
 		row.style.backgroundColor = "rgba(255,255,255,.18)";
@@ -68,19 +68,58 @@
 		return Number.isInteger(n) && n >= 0 ? n : null;
 	}
 
+	// Position of the song in the context's own list (playlist order / Liked Songs order),
+	// for when Spotify doesn't report it. Cached per context for a minute.
+	const indexCache = new Map();
+	async function contextUris(contextUri) {
+		const hit = indexCache.get(contextUri);
+		if (hit && Date.now() - hit.at < 60000) return hit.uris;
+		let uris = null;
+		if (/:collection(:|$)/.test(contextUri) && S.Platform.LibraryAPI?.getTracks) {
+			const res = await S.Platform.LibraryAPI.getTracks({ limit: 9999999 });
+			uris = (res?.items || []).map(i => i.uri);
+		} else if (contextUri.startsWith("spotify:playlist:") && S.Platform.PlaylistAPI?.getContents) {
+			uris = [];
+			for (let offset = 0; ;) {
+				const res = await S.Platform.PlaylistAPI.getContents(contextUri, { offset, limit: 1000 });
+				const items = res?.items || [];
+				uris.push(...items.map(i => i.uri));
+				offset += items.length;
+				if (!items.length || offset >= (res?.totalLength ?? 0)) break;
+			}
+		}
+		if (uris) indexCache.set(contextUri, { at: Date.now(), uris });
+		return uris;
+	}
+
+	async function findIndex(uri) {
+		const reported = playingIndex();
+		if (reported != null) return reported;
+		try {
+			const uris = await contextUris(S.Player.data?.context?.uri || "");
+			const i = uris ? uris.indexOf(uri) : -1;
+			return i >= 0 ? i : null;
+		} catch (err) {
+			console.warn(LOG, "Couldn't read the list to find the song's position", err);
+			return null;
+		}
+	}
+
+	const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
 	async function run(myRun) {
 		const uri = S.Player.data?.item?.uri;
 		if (!uri) return;
+		const indexPromise = findIndex(uri); // start fetching while the page renders
 
 		// Wait for the track list to render (up to ~6s).
 		let rows = [];
-		for (let i = 0; i < 60 && myRun === runId; i++) {
+		for (let i = 0; i < 120 && myRun === runId; i++) {
 			rows = trackRows();
 			if (rows.length) break;
-			await sleep(100);
+			await sleep(50);
 		}
 		if (!rows.length || myRun !== runId) return;
-		await sleep(150);
 
 		let row = findPlayingRow(uri);
 		if (row) return highlight(row);
@@ -88,34 +127,69 @@
 		const scroller = scrollerOf(rows[0]);
 		userScrolled = false;
 		const stillOurs = () => myRun === runId && !userScrolled;
+		// Spotify may animate scrolling; jump instantly while we search.
+		const prevBehavior = scroller.style.scrollBehavior;
+		scroller.style.scrollBehavior = "auto";
+		const done = r => { scroller.style.scrollBehavior = prevBehavior; if (r) highlight(r); };
+		// After each jump, wait until Spotify has actually drawn rows in view (it renders
+		// lazily and can lag behind the scroll), then look for the song.
+		const oneFrame = () => new Promise(r => requestAnimationFrame(r));
+		const rowsInView = () => {
+			const sr = scroller.getBoundingClientRect();
+			return trackRows().some(r => { const q = r.getBoundingClientRect(); return q.height && q.bottom > sr.top + 1 && q.top < sr.bottom - 1; });
+		};
+		const check = async () => {
+			const t0 = performance.now();
+			while (performance.now() - t0 < 1500) {
+				await oneFrame();
+				const found = findPlayingRow(uri);
+				if (found) return found;
+				if (rowsInView() && performance.now() - t0 > 30) {
+					await frame(); // let the rest of the screen finish drawing
+					return findPlayingRow(uri);
+				}
+			}
+			return findPlayingRow(uri);
+		};
 
-		// 1) Jump to an estimate from the song's position in the playlist.
-		const index = playingIndex();
-		const ref = rows.find(r => r.hasAttribute("aria-rowindex"));
-		if (index != null && ref) {
-			const rowH = ref.getBoundingClientRect().height || 56;
-			const refIndex = Number(ref.getAttribute("aria-rowindex"));
-			const targetIndex = index + 2; // aria-rowindex: 1 = header, 2 = first track
-			const offset = ref.getBoundingClientRect().top - scroller.getBoundingClientRect().top + (targetIndex - refIndex) * rowH;
+		// 1) Jump to where the song should be.
+		const index = await indexPromise;
+		if (!stillOurs()) return done();
+		if (index != null) {
+			const dataRow = rows.find(r => r.hasAttribute("aria-rowindex")) || rows[0];
+			const rowH = dataRow.getBoundingClientRect().height || 56;
+			const refIndex = dataRow.hasAttribute("aria-rowindex")
+				? Number(dataRow.getAttribute("aria-rowindex")) - 2 // 1 = header, 2 = first track
+				: null;
+			let offset;
+			if (refIndex != null) {
+				offset = dataRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top + (index - refIndex) * rowH;
+			} else {
+				const grid = dataRow.closest('[role="grid"]') || dataRow.parentElement;
+				offset = grid.getBoundingClientRect().top - scroller.getBoundingClientRect().top + index * rowH;
+			}
 			scroller.scrollTop += offset - scroller.clientHeight / 2;
-			for (let i = 0; i < 8 && stillOurs(); i++) {
-				await sleep(80);
-				row = findPlayingRow(uri);
-				if (row) return highlight(row);
+			if ((row = await check()) || (row = await check())) return done(row);
+
+			// 2) Slightly off? Look a few screens either side before giving up on the estimate.
+			const centre = scroller.scrollTop, stepPx = scroller.clientHeight * 0.9;
+			for (const k of [1, -1, 2, -2, 3, -3]) {
+				if (!stillOurs()) return done();
+				scroller.scrollTop = centre + k * stepPx;
+				if ((row = await check())) return done(row);
 			}
 		}
 
-		// 2) Fallback (e.g. custom sort): sweep from the top until the song shows up.
-		if (!stillOurs()) return;
+		// 3) Fallback (e.g. custom sort): fast sweep from the top.
+		if (!stillOurs()) return done();
 		scroller.scrollTop = 0;
-		for (let step = 0; step < 600 && stillOurs(); step++) {
-			await sleep(60);
-			row = findPlayingRow(uri);
-			if (row) return highlight(row);
+		for (let step = 0; step < 2000 && stillOurs(); step++) {
+			if ((row = await check())) return done(row);
 			const before = scroller.scrollTop;
-			scroller.scrollTop += scroller.clientHeight * 0.8;
+			scroller.scrollTop += scroller.clientHeight;
 			if (scroller.scrollTop === before) break; // reached the end
 		}
+		done();
 		if (stillOurs()) console.info(LOG, "Playing song not found in this view.");
 	}
 
