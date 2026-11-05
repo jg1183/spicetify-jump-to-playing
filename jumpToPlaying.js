@@ -107,30 +107,61 @@
 
 	const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-	async function run(myRun) {
+	function inView(row) {
+		if (!row?.isConnected) return false;
+		const sr = scrollerOf(row).getBoundingClientRect(), q = row.getBoundingClientRect();
+		return q.height > 0 && q.bottom > sr.top && q.top < sr.bottom;
+	}
+
+	// Spotify sometimes resets/restores the scroll position after the page has finished
+	// loading, undoing our jump. Check again shortly after and search again if that happened.
+	async function verify(myRun, uri, retried) {
+		await sleep(700);
+		if (myRun !== runId || userScrolled) return;
+		const row = findPlayingRow(uri);
+		if (inView(row)) return;
+		if (row) return row.scrollIntoView({ block: "center", behavior: "instant" });
+		if (!retried) run(myRun, new Set(), true).catch(err => console.error(LOG, err));
+	}
+
+	async function run(myRun, stale, retried = false) {
 		const uri = S.Player.data?.item?.uri;
 		if (!uri) return;
 		const indexPromise = findIndex(uri); // start fetching while the page renders
 
-		// Wait for the track list to render (up to ~6s).
+		// Wait for the NEW page's track list to render (up to ~6s). Right after you click,
+		// the previous page's rows are often still on screen; using those was why it
+		// sometimes did nothing until you went away and came back.
 		let rows = [];
+		const t0 = performance.now();
 		for (let i = 0; i < 120 && myRun === runId; i++) {
-			rows = trackRows();
+			const all = trackRows();
+			rows = all.filter(r => !stale.has(r));
+			// Nothing new but rows still there after a while: they already were the new page.
+			if (!rows.length && performance.now() - t0 > 1500) rows = all;
 			if (rows.length) break;
 			await sleep(50);
 		}
 		if (!rows.length || myRun !== runId) return;
+		// Give Spotify a moment to finish laying out / restoring scroll before we move it.
+		await frame();
+		await sleep(150);
+		if (myRun !== runId) return;
+		rows = trackRows();
+		if (!rows.length) return;
 
 		let row = findPlayingRow(uri);
-		if (row) return highlight(row);
+		if (row) { highlight(row); verify(myRun, uri, retried); return; }
 
 		const scroller = scrollerOf(rows[0]);
-		userScrolled = false;
 		const stillOurs = () => myRun === runId && !userScrolled;
 		// Spotify may animate scrolling; jump instantly while we search.
 		const prevBehavior = scroller.style.scrollBehavior;
 		scroller.style.scrollBehavior = "auto";
-		const done = r => { scroller.style.scrollBehavior = prevBehavior; if (r) highlight(r); };
+		const done = r => {
+			scroller.style.scrollBehavior = prevBehavior;
+			if (r) { highlight(r); verify(myRun, uri, retried); }
+		};
 		// After each jump, wait until Spotify has actually drawn rows in view (it renders
 		// lazily and can lag behind the scroll), then look for the song.
 		const oneFrame = () => new Promise(r => requestAnimationFrame(r));
@@ -200,8 +231,11 @@
 		const path = (location?.pathname || "").replace(/\/$/, "");
 		const playing = contextPath(S.Player.data?.context?.uri);
 		if (!playing || path !== playing) return;
+		// Remember which rows belong to the page we're leaving, so we don't search those.
+		const stale = new Set(trackRows());
+		userScrolled = false;
 		const myRun = ++runId;
-		run(myRun).catch(err => console.error(LOG, err));
+		run(myRun, stale).catch(err => console.error(LOG, err));
 	}
 
 	S.Platform.History.listen(onLocation);
